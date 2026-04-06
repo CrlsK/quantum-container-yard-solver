@@ -1,11 +1,16 @@
 """
-QCentroid Quantum-Inspired Container Yard Stacking Optimization Solver
+QCentroid Quantum-Inspired Container Yard Stacking Optimization Solver (v1.1)
 
 Simulated Quantum Annealing (SQA) using Suzuki-Trotter decomposition:
   - Multiple Trotter replicas hold parallel stacking plans
   - Transverse field coupling enables quantum tunneling between replicas
   - Path-integral Monte Carlo updates explore solution space
   - Annealing schedule reduces transverse field, freezing into good solutions
+
+v1.1 Upgrade:
+  - Vessel-aware greedy initialization with load balancing
+  - Weight balance penalty in objective function
+  - Improved block utilization through grouping optimization
 
 Based on: Kadowaki & Nishimori (1998), Martonak et al. (2002),
 Das & Chakrabarti (2008).
@@ -166,49 +171,96 @@ def estimate_reshuffles_single(container_id, stacking_plan):
 
 
 def greedy_initial_stacking(containers, yard_layout, logger):
-    sorted_containers = sorted(containers, key=lambda c: (c['vessel_departure_order'], -c['weight_tonnes']))
-    container_map = {c['id']: c for c in containers}
+    logger.info("Starting vessel-aware greedy initialization with " + str(len(containers)) + " containers")
+    vessel_groups = {}
+    for container in containers:
+        vessel_id = container['vessel_id']
+        if vessel_id not in vessel_groups:
+            vessel_groups[vessel_id] = []
+        vessel_groups[vessel_id].append(container)
+    sorted_vessels = sorted(vessel_groups.items(), key=lambda x: x[1][0]['vessel_departure_order'])
     stacking_plan = []
+    container_map = {c['id']: c for c in containers}
     stack_usage = {}
-    for container in sorted_containers:
-        cid = container['id']
-        weight = container['weight_tonnes']
-        placed = False
-        for block in yard_layout['blocks']:
-            if placed:
-                break
+    block_capacities = {}
+    for block in yard_layout['blocks']:
+        block_capacities[block['block_id']] = {'capacity': block['total_capacity'], 'used': 0}
+
+    def find_preferred_block(vessel_id, yard_layout, block_capacities):
+        blocks = yard_layout['blocks']
+        available_blocks = []
+        for block in blocks:
             block_id = block['block_id']
-            max_tier = block['max_tier_height']
-            for row_idx in range(block['rows']):
+            current_util = block_capacities[block_id]['used'] / block_capacities[block_id]['capacity']
+            available_capacity = block_capacities[block_id]['capacity'] - block_capacities[block_id]['used']
+            if available_capacity > 0:
+                available_blocks.append((block_id, current_util, available_capacity))
+        if not available_blocks:
+            return None
+        available_blocks.sort(key=lambda x: x[1])
+        return available_blocks[0][0]
+
+    for vessel_id, vessel_containers in sorted_vessels:
+        vessel_containers_sorted = sorted(vessel_containers, key=lambda c: -c['weight_tonnes'])
+        preferred_block = find_preferred_block(vessel_id, yard_layout, block_capacities)
+        if preferred_block is None:
+            logger.warning("No available blocks for vessel " + str(vessel_id))
+            continue
+        for container in vessel_containers_sorted:
+            cid = container['id']
+            weight = container['weight_tonnes']
+            placed = False
+            blocks_to_try = [preferred_block]
+            if block_capacities[preferred_block]['used'] >= block_capacities[preferred_block]['capacity']:
+                blocks_to_try = [b['block_id'] for b in yard_layout['blocks'] if b['block_id'] != preferred_block]
+            for block_id in blocks_to_try:
                 if placed:
                     break
-                for bay_idx in range(block['bays_per_row']):
-                    stack_key = (block_id, row_idx, bay_idx)
-                    current_tier = stack_usage.get(stack_key, 0)
-                    if current_tier < max_tier:
-                        can_place = True
-                        if current_tier > 0:
-                            for existing in stacking_plan:
-                                if (existing['assigned_block'] == block_id and existing['assigned_row'] == row_idx and existing['assigned_bay'] == bay_idx and existing['tier_level'] == current_tier - 1):
-                                    below_w = container_map[existing['id']]['weight_tonnes']
-                                    if below_w < weight:
-                                        can_place = False
-                                    break
-                        if can_place:
-                            stacking_plan.append({'id': cid, 'assigned_block': block_id, 'assigned_row': row_idx, 'assigned_bay': bay_idx, 'tier_level': current_tier, 'reshuffles_if_retrieved_now': 0})
-                            stack_usage[stack_key] = current_tier + 1
-                            placed = True
-                            break
-        if not placed:
-            logger.warning("Could not place container " + cid)
+                block = None
+                for b in yard_layout['blocks']:
+                    if b['block_id'] == block_id:
+                        block = b
+                        break
+                if block is None:
+                    continue
+                max_tier = block['max_tier_height']
+                for row_idx in range(block['rows']):
+                    if placed:
+                        break
+                    for bay_idx in range(block['bays_per_row']):
+                        stack_key = (block_id, row_idx, bay_idx)
+                        current_tier = stack_usage.get(stack_key, 0)
+                        if current_tier < max_tier:
+                            can_place = True
+                            if current_tier > 0:
+                                for existing in stacking_plan:
+                                    if (existing['assigned_block'] == block_id and existing['assigned_row'] == row_idx and existing['assigned_bay'] == bay_idx and existing['tier_level'] == current_tier - 1):
+                                        below_weight = container_map[existing['id']]['weight_tonnes']
+                                        if below_weight < weight:
+                                            can_place = False
+                                        break
+                            if can_place:
+                                stacking_plan.append({'id': cid, 'assigned_block': block_id, 'assigned_row': row_idx, 'assigned_bay': bay_idx, 'tier_level': current_tier, 'reshuffles_if_retrieved_now': 0})
+                                stack_usage[stack_key] = current_tier + 1
+                                block_capacities[block_id]['used'] += 1
+                                placed = True
+                                break
+            if not placed:
+                logger.warning("Could not place container " + str(cid))
     logger.info("Greedy placement: " + str(len(stacking_plan)) + "/" + str(len(containers)) + " placed")
     return stacking_plan
 
 
-def compute_objective(stacking_plan, containers, grouping_weight=0.5):
+def compute_objective(stacking_plan, containers, grouping_weight=0.5, balance_weight=0.3, yard_layout=None):
     total_reshuffles, _ = compute_reshuffles_for_stacking(stacking_plan, containers)
     grouping_score = compute_vessel_grouping_score(stacking_plan, containers)
-    return total_reshuffles + (1.0 - grouping_score) * grouping_weight * 100
+    grouping_penalty = (1.0 - grouping_score) * grouping_weight * 100
+    balance_penalty = 0.0
+    if yard_layout and balance_weight > 0:
+        container_map = {c['id']: c for c in containers}
+        balance_score = compute_weight_balance_score(stacking_plan, container_map, yard_layout)
+        balance_penalty = (1.0 - balance_score) * balance_weight * 100
+    return total_reshuffles + grouping_penalty + balance_penalty
 
 
 def sqa_swap_move(plan, container_map, yard_layout):
@@ -266,6 +318,7 @@ def simulated_quantum_annealing(initial_plan, containers, yard_layout, params, l
     T_init = params.get('temperature_init', 5.0)
     T_final = params.get('temperature_final', 0.1)
     grouping_weight = params.get('grouping_weight', 0.5)
+    balance_weight = params.get('balance_weight', 0.3)
     seed = params.get('random_seed', None)
     if seed is not None:
         random.seed(seed)
@@ -275,7 +328,7 @@ def simulated_quantum_annealing(initial_plan, containers, yard_layout, params, l
     logger.info("Monte Carlo sweeps: " + str(num_sweeps))
     logger.info("Transverse field: " + str(gamma_0) + " -> " + str(gamma_final))
     replicas = [deepcopy(initial_plan) for _ in range(P)]
-    replica_energies = [compute_objective(r, containers, grouping_weight) for r in replicas]
+    replica_energies = [compute_objective(r, containers, grouping_weight, balance_weight, yard_layout) for r in replicas]
     best_obj = min(replica_energies)
     best_plan = deepcopy(replicas[replica_energies.index(best_obj)])
     convergence_history = []
@@ -295,7 +348,7 @@ def simulated_quantum_annealing(initial_plan, containers, yard_layout, params, l
                 candidate = sqa_swap_move(replicas[p], container_map, yard_layout)
             else:
                 candidate = sqa_relocate_move(replicas[p], container_map, yard_layout)
-            candidate_energy = compute_objective(candidate, containers, grouping_weight)
+            candidate_energy = compute_objective(candidate, containers, grouping_weight, balance_weight, yard_layout)
             delta_E_classical = candidate_energy - replica_energies[p]
             delta_E_quantum = 0.0
             if P > 1 and gamma_t > 0.01:
@@ -422,7 +475,7 @@ def run(input_data, solver_params=None, extra_arguments=None):
         params = data.get('parameters', {})
         if solver_params:
             params.update(solver_params)
-        logger.info("Quantum-Inspired Container Yard Stacking Solver (SQA)")
+        logger.info("Quantum-Inspired Container Yard Stacking Solver (SQA) v1.1")
         logger.info("Algorithm: Simulated Quantum Annealing / Suzuki-Trotter")
         logger.info("Input: " + str(len(containers)) + " containers, " + str(yard_layout.get('total_blocks', 0)) + " blocks")
         if not containers or not yard_layout:
@@ -433,7 +486,7 @@ def run(input_data, solver_params=None, extra_arguments=None):
         if not initial_plan:
             logger.error("Greedy initialization failed")
             return {"status": "ERROR", "message": "Failed to create initial stacking plan"}
-        greedy_obj = compute_objective(initial_plan, containers, params.get('grouping_weight', 0.5))
+        greedy_obj = compute_objective(initial_plan, containers, params.get('grouping_weight', 0.5), params.get('balance_weight', 0.3), yard_layout)
         logger.info("Greedy objective: " + str(round(greedy_obj, 2)))
         logger.info("Phase 2: Simulated Quantum Annealing")
         best_plan, best_obj, convergence_history, quantum_metrics = simulated_quantum_annealing(initial_plan, containers, yard_layout, params, logger)
@@ -455,7 +508,7 @@ def run(input_data, solver_params=None, extra_arguments=None):
         convergence_chart = generate_convergence_chart_data(convergence_history)
         improvement_pct = round((1 - best_obj / max(greedy_obj, 0.01)) * 100, 1)
         quantum_advantage = {'tunnel_events': quantum_metrics['tunnel_events'], 'tunnel_rate': quantum_metrics['tunnel_rate'], 'quantum_advantage_indicator': quantum_metrics['quantum_advantage_indicator'], 'description': ('High quantum tunneling activity - SQA explored regions unreachable by classical SA' if quantum_metrics['tunnel_events'] > 10 else 'Moderate quantum effects observed'), 'hardware_ready': True, 'target_hardware': 'D-Wave Advantage (5000+ qubits)', 'estimated_qubit_count': len(containers) * len(yard_layout.get('blocks', [])) * 4, 'papers': ['Kadowaki & Nishimori (1998)', 'Martonak et al. (2002)', 'Das & Chakrabarti (2008)']}
-        output = {'objective_value': round(best_obj, 2), 'solution_status': 'optimal' if best_obj < greedy_obj else 'feasible', 'stacking_plan': output_stacking_plan, 'reshuffling_summary': vessel_summary, 'optimization_metrics': {'total_reshuffles': metrics['total_reshuffles'], 'average_reshuffles_per_vessel': round(metrics['average_reshuffles_per_vessel'], 2), 'max_reshuffles_single_vessel': metrics['max_reshuffles_single_vessel'], 'vessel_grouping_score': round(metrics['vessel_grouping_score'], 3), 'stack_utilization': round(metrics['stack_utilization'], 3), 'weight_balance_score': round(metrics['weight_balance_score'], 3)}, 'cost_breakdown': {'total_reshuffles': metrics['total_reshuffles'], 'greedy_reshuffles': round(greedy_obj, 2), 'optimized_reshuffles': round(best_obj, 2), 'improvement_pct': improvement_pct}, 'optimization_convergence': {'greedy_initial_cost': round(greedy_obj, 2), 'sqa_cost': round(best_obj, 2), 'final_optimized_cost': round(best_obj, 2), 'total_sweeps': quantum_metrics['total_sweeps'], 'trotter_slices': quantum_metrics['trotter_slices']}, 'quantum_metrics': quantum_metrics, 'quantum_advantage': quantum_advantage, 'showcase': {'block_heatmap': block_heatmap, 'vessel_timeline': vessel_timeline, 'convergence_chart': convergence_chart, 'summary_dashboard': {'total_containers': len(containers), 'total_placed': len(output_stacking_plan), 'total_reshuffles': metrics['total_reshuffles'], 'improvement_vs_greedy_pct': improvement_pct, 'vessels_with_zero_reshuffles': sum(1 for v in vessel_summary if v['estimated_reshuffles'] == 0), 'total_vessels': len(vessel_summary), 'avg_stack_utilization_pct': round(metrics['stack_utilization'] * 100, 1), 'weight_balance_score_pct': round(metrics['weight_balance_score'] * 100, 1), 'vessel_grouping_score_pct': round(metrics['vessel_grouping_score'] * 100, 1), 'quantum_tunnel_events': quantum_metrics['tunnel_events'], 'solver_time_ms': round(elapsed_ms, 1), 'algorithm': 'SQA (Suzuki-Trotter ' + str(quantum_metrics['trotter_slices']) + ' replicas)'}}, 'computation_metrics': {'wall_time_s': round(elapsed_s, 3), 'algorithm': 'SQA_SuzukiTrotter_v1.0', 'solver_version': '1.0', 'trotter_slices': quantum_metrics['trotter_slices'], 'total_sweeps': quantum_metrics['total_sweeps']}, 'benchmark': {'execution_cost': {'value': 1.0, 'unit': 'credits'}, 'time_elapsed': str(round(elapsed_s, 3)) + 's', 'energy_consumption': 0.0}}
+        output = {'objective_value': round(best_obj, 2), 'solution_status': 'optimal' if best_obj < greedy_obj else 'feasible', 'stacking_plan': output_stacking_plan, 'reshuffling_summary': vessel_summary, 'optimization_metrics': {'total_reshuffles': metrics['total_reshuffles'], 'average_reshuffles_per_vessel': round(metrics['average_reshuffles_per_vessel'], 2), 'max_reshuffles_single_vessel': metrics['max_reshuffles_single_vessel'], 'vessel_grouping_score': round(metrics['vessel_grouping_score'], 3), 'stack_utilization': round(metrics['stack_utilization'], 3), 'weight_balance_score': round(metrics['weight_balance_score'], 3)}, 'cost_breakdown': {'total_reshuffles': metrics['total_reshuffles'], 'greedy_reshuffles': round(greedy_obj, 2), 'optimized_reshuffles': round(best_obj, 2), 'improvement_pct': improvement_pct}, 'optimization_convergence': {'greedy_initial_cost': round(greedy_obj, 2), 'sqa_cost': round(best_obj, 2), 'final_optimized_cost': round(best_obj, 2), 'total_sweeps': quantum_metrics['total_sweeps'], 'trotter_slices': quantum_metrics['trotter_slices']}, 'quantum_metrics': quantum_metrics, 'quantum_advantage': quantum_advantage, 'showcase': {'block_heatmap': block_heatmap, 'vessel_timeline': vessel_timeline, 'convergence_chart': convergence_chart, 'summary_dashboard': {'total_containers': len(containers), 'total_placed': len(output_stacking_plan), 'total_reshuffles': metrics['total_reshuffles'], 'improvement_vs_greedy_pct': improvement_pct, 'vessels_with_zero_reshuffles': sum(1 for v in vessel_summary if v['estimated_reshuffles'] == 0), 'total_vessels': len(vessel_summary), 'avg_stack_utilization_pct': round(metrics['stack_utilization'] * 100, 1), 'weight_balance_score_pct': round(metrics['weight_balance_score'] * 100, 1), 'vessel_grouping_score_pct': round(metrics['vessel_grouping_score'] * 100, 1), 'quantum_tunnel_events': quantum_metrics['tunnel_events'], 'solver_time_ms': round(elapsed_ms, 1), 'algorithm': 'SQA (Suzuki-Trotter ' + str(quantum_metrics['trotter_slices']) + ' replicas)'}}, 'computation_metrics': {'wall_time_s': round(elapsed_s, 3), 'algorithm': 'SQA_SuzukiTrotter_v1.1', 'solver_version': '1.1', 'trotter_slices': quantum_metrics['trotter_slices'], 'total_sweeps': quantum_metrics['total_sweeps']}, 'benchmark': {'execution_cost': {'value': 1.0, 'unit': 'credits'}, 'time_elapsed': str(round(elapsed_s, 3)) + 's', 'energy_consumption': 0.0}}
         logger.info("Solver completed in " + str(round(elapsed_ms, 1)) + " ms")
         logger.info("Objective: " + str(round(best_obj, 2)) + " (improvement: " + str(improvement_pct) + "%)")
         logger.info("Quantum tunneling events: " + str(quantum_metrics['tunnel_events']))
@@ -463,4 +516,4 @@ def run(input_data, solver_params=None, extra_arguments=None):
     except Exception as e:
         logger.error("Solver failed: " + str(e))
         elapsed_s = (time.time() - start_time)
-        return {'status': 'ERROR', 'message': str(e), 'objective_value': 999999, 'solution_status': 'error', 'benchmark': {'execution_cost': {'value': 1.0, 'unit': 'credits'}, 'time_elapsed': str(round(elapsed_s, 3)) + 's', 'energy_consumption': 0.0}, 'computation_metrics': {'wall_time_s': round(elapsed_s, 3), 'algorithm': 'SQA_SuzukiTrotter_v1.0'}}
+        return {'status': 'ERROR', 'message': str(e), 'objective_value': 999999, 'solution_status': 'error', 'benchmark': {'execution_cost': {'value': 1.0, 'unit': 'credits'}, 'time_elapsed': str(round(elapsed_s, 3)) + 's', 'energy_consumption': 0.0}, 'computation_metrics': {'wall_time_s': round(elapsed_s, 3), 'algorithm': 'SQA_SuzukiTrotter_v1.1'}}
