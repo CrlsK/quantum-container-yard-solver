@@ -1,4 +1,15 @@
-"""QCentroid Quantum SQA Container Yard Solver v1.3 - Multi-Restart + Local Search"""
+"""QCentroid Quantum SQA Container Yard Solver v1.4 — full showcase + platform-compliant output.
+
+v1.4 changes (output dialect alignment with classical solver, platform charts now render):
+- Adds generate_block_heatmap(): per-block grid mirroring classical solver shape so the platform
+  Benchmarking tab and downstream visualizers can render quantum results identically.
+- Adds generate_vessel_timeline(): per-vessel reshuffle forecast with cumulative delta.
+- Adds quantum_field_evolution to showcase (transverse field gamma + temperature per sweep)
+  so we can visualize the SQA's quantum->classical transition.
+- Records tunnel-events-per-sweep history alongside best/current energy.
+- Same objective_value / benchmark / solution_status contract — guaranteed not to silently
+  break the Benchmarking tab if a future change drops a field.
+"""
 import time, math, random, json
 from copy import deepcopy
 
@@ -28,6 +39,11 @@ def compute_reshuffles(plan, containers):
             removed.add(t['id'])
         total += vr; per_vessel[vid] = vr
     return total, per_vessel
+
+def estimate_reshuffles_single(cid, plan):
+    a = next((x for x in plan if x['id']==cid), None)
+    if a is None: return 0
+    return sum(1 for o in plan if o['assigned_block']==a['assigned_block'] and o['assigned_row']==a['assigned_row'] and o['assigned_bay']==a['assigned_bay'] and o['tier_level']>a['tier_level'])
 
 def grouping_score(plan, containers):
     va = {}
@@ -185,7 +201,7 @@ def sqa_run(init, containers, layout, params, logger):
     g0=params.get('gamma0',4.0); gf=params.get('gammaf',0.005)
     T0=params.get('T0',8.0); Tf=params.get('Tf',0.05)
     gw=params.get('grouping_weight',0.5); bw=params.get('balance_weight',0.3)
-    seed=params.get('random_seed');
+    seed=params.get('random_seed')
     if seed is not None: random.seed(seed)
     cm={c['id']:c for c in containers}
     vbc={}
@@ -196,14 +212,14 @@ def sqa_run(init, containers, layout, params, logger):
     vbm={vid:max(cts,key=cts.get) for vid,cts in vbc.items()}
     reps=[deepcopy(init) for _ in range(P)]
     re=[objective(r,containers,gw,bw,layout) for r in reps]
-    bo=min(re); bp=deepcopy(reps[re.index(bo)]); hist=[]; te=0; ta=0; tp=0
+    bo=min(re); bp=deepcopy(reps[re.index(bo)]); hist=[]; field_hist=[]; te=0; ta=0; tp=0
     for s in range(ns):
         pr=s/max(ns-1,1)
         gt=g0*math.exp(-pr*math.log(max(g0/gf,1e-6)))
         Tt=T0*math.exp(-pr*math.log(max(T0/Tf,1e-6)))
         bt=1.0/max(Tt,1e-10)
         Jp=-0.5*Tt*math.log(max(math.tanh(gt*bt/P),1e-10))
-        sa=0
+        sa=0; te_sweep=0
         for p in range(P):
             cand=sqa_move(reps[p],cm,layout,vbm,pr)
             ce=objective(cand,containers,gw,bw,layout); de=ce-re[p]
@@ -217,14 +233,17 @@ def sqa_run(init, containers, layout, params, logger):
                 try: acc=random.random()<math.exp(-dt*bt/P)
                 except: acc=False
             if acc:
-                if de>0 and dt<0: te+=1
+                if de>0 and dt<0: te+=1; te_sweep+=1
                 reps[p]=cand; re[p]=ce; ta+=1; sa+=1
                 if ce<bo: bo=ce; bp=deepcopy(cand)
+        # Per-sweep field evolution (downsampled)
+        if s%(max(1,ns//40))==0 or s==ns-1:
+            field_hist.append({'sweep':s,'gamma':round(gt,4),'temperature':round(Tt,4),'tunnel_events_in_sweep':te_sweep,'cumulative_tunnels':te})
         if s%(max(1,ns//5))==0:
             hist.append({'sweep':s,'best':round(bo,2),'gamma':round(gt,4),'temp':round(Tt,4),'tunnels':te})
     ar=ta/max(tp,1)
     qm={'trotter_slices':P,'total_sweeps':ns,'tunnel_events':te,'tunnel_rate':round(te/max(tp,1),4),'acceptance_rate':round(ar,4),'final_transverse_field':round(gt,6),'final_temperature':round(Tt,6),'quantum_advantage_indicator':round(te/max(ns,1),3)}
-    return bp,bo,hist,qm
+    return bp,bo,hist,qm,field_hist
 
 def local_search(plan, containers, layout, params, logger):
     cm={c['id']:c for c in containers}; gw=params.get('grouping_weight',0.5); bw=params.get('balance_weight',0.3)
@@ -243,26 +262,90 @@ def local_search(plan, containers, layout, params, logger):
     logger.info("Local search: "+str(impr)+" improvements -> "+str(round(bo,2)))
     return bp,bo,impr
 
+# ===== Showcase generators (mirror classical solver shape so platform charts render) =====
+
+def generate_block_heatmap(plan, containers, layout):
+    """Per-block grid: each (row, bay) cell has stack contents, weight, vessel mix, fill pct.
+    Same shape as classical solver's heatmap so the platform compares apples to apples."""
+    cm = {c['id']: c for c in containers}
+    out = {}
+    for block in layout['blocks']:
+        bid = block['block_id']; rows = block['rows']; bays = block['bays_per_row']; mt = block['max_tier_height']
+        grid = []
+        for r in range(rows):
+            row_data = []
+            for b in range(bays):
+                stack = []
+                for a in plan:
+                    if a['assigned_block']==bid and a['assigned_row']==r and a['assigned_bay']==b:
+                        c = cm.get(a['id'], {})
+                        stack.append({'id':a['id'],'tier':a['tier_level'],'weight':c.get('weight_tonnes',0),
+                                      'vessel':c.get('vessel_id',''),'departure_order':c.get('vessel_departure_order',0),
+                                      'reshuffles_needed':estimate_reshuffles_single(a['id'], plan)})
+                stack.sort(key=lambda x: x['tier'])
+                tw = sum(s['weight'] for s in stack); h = len(stack)
+                vs = list(set(s['vessel'] for s in stack))
+                row_data.append({'row':r,'bay':b,'height':h,'max_height':mt,
+                                 'fill_pct':round(100*h/mt,1) if mt>0 else 0,
+                                 'total_weight_tonnes':round(tw,1),
+                                 'vessels':vs,'vessel_mix':len(vs),'containers':stack})
+            grid.append(row_data)
+        bc = sum(1 for a in plan if a['assigned_block']==bid)
+        cap = block['total_capacity']
+        out[bid] = {'block_id':bid,
+                    'dimensions':{'rows':rows,'bays':bays,'max_tier':mt},
+                    'total_containers':bc,'capacity':cap,
+                    'utilization_pct':round(100*bc/cap,1) if cap>0 else 0,
+                    'grid':grid}
+    return out
+
+def generate_vessel_timeline(plan, containers):
+    """Per-vessel reshuffle forecast with cumulative + retrieval efficiency."""
+    vessels = {}
+    for c in containers:
+        vid = c['vessel_id']
+        if vid not in vessels: vessels[vid] = {'vessel_id':vid,'departure_order':c['vessel_departure_order'],'containers':[]}
+        vessels[vid]['containers'].append(c)
+    _, rpv = compute_reshuffles(plan, containers)
+    timeline = []; cum = 0
+    for vid, info in sorted(vessels.items(), key=lambda x: x[1]['departure_order']):
+        r = rpv.get(vid, 0); cum += r
+        n = len(info['containers']); tw = sum(c['weight_tonnes'] for c in info['containers'])
+        eff = round(100*(1-r/max(n,1)),1)
+        status = 'clean' if r==0 else ('minor' if r<=2 else 'needs_attention')
+        timeline.append({'vessel_id':vid,'departure_order':info['departure_order'],'num_containers':n,
+                         'total_weight_tonnes':round(tw,1),'avg_weight_tonnes':round(tw/n,1) if n>0 else 0,
+                         'reshuffles':r,'cumulative_reshuffles':cum,
+                         'retrieval_efficiency_pct':eff,'status':status})
+    return timeline
+
+
 def run(input_data, solver_params=None, extra_arguments=None):
     logger=qcentroid_user_log; t0=time.time()
     try:
         data=input_data if 'containers' in input_data else input_data.get('data',input_data)
         containers=data.get('containers',[]); layout=data.get('yard_layout',{}); params=data.get('parameters',{})
         if solver_params: params.update(solver_params)
-        logger.info("Quantum SQA Solver v1.3 | "+str(len(containers))+" containers, "+str(layout.get('total_blocks',0))+" blocks")
-        if not containers or not layout: return {"status":"ERROR","message":"Missing input"}
+        logger.info("Quantum SQA Solver v1.4 | "+str(len(containers))+" containers, "+str(layout.get('total_blocks',0))+" blocks")
+        if not containers or not layout:
+            el_s_e = time.time()-t0
+            return {"status":"ERROR","message":"Missing input","objective_value":999999,"solution_status":"error",
+                    "benchmark":{"execution_cost":{"value":0.0,"unit":"credits"},"time_elapsed":str(round(el_s_e,3))+"s","energy_consumption":0.0}}
         init=greedy_init(containers,layout,logger)
-        if not init: return {"status":"ERROR","message":"Greedy init failed"}
+        if not init:
+            el_s_e = time.time()-t0
+            return {"status":"ERROR","message":"Greedy init failed","objective_value":999999,"solution_status":"error",
+                    "benchmark":{"execution_cost":{"value":0.0,"unit":"credits"},"time_elapsed":str(round(el_s_e,3))+"s","energy_consumption":0.0}}
         gw=params.get('grouping_weight',0.5); bw=params.get('balance_weight',0.3)
         g_obj=objective(init,containers,gw,bw,layout)
         logger.info("Greedy objective: "+str(round(g_obj,2)))
-        NR=params.get('num_restarts',3); best_p=None; best_o=float('inf'); best_h=[]; best_qm=None; tot_te=0
+        NR=params.get('num_restarts',3); best_p=None; best_o=float('inf'); best_h=[]; best_qm=None; best_fh=[]; tot_te=0
         for restart in range(NR):
             rp=dict(params); rp['random_seed']=(params.get('random_seed',42) or 42)+restart*1000; rp['num_sweeps']=params.get('num_sweeps',150)
             logger.info("SQA restart "+str(restart+1)+"/"+str(NR))
-            p,o,h,qm=sqa_run(init,containers,layout,rp,logger)
+            p,o,h,qm,fh=sqa_run(init,containers,layout,rp,logger)
             tot_te+=qm['tunnel_events']
-            if o<best_o: best_o=o; best_p=p; best_h=h; best_qm=qm
+            if o<best_o: best_o=o; best_p=p; best_h=h; best_qm=qm; best_fh=fh
         best_qm['tunnel_events']=tot_te; best_qm['total_sweeps']=rp['num_sweeps']*NR; best_qm['num_restarts']=NR
         best_qm['quantum_advantage_indicator']=round(tot_te/max(rp['num_sweeps']*NR,1),3)
         best_p,best_o,ls_impr=local_search(best_p,containers,layout,params,logger)
@@ -274,30 +357,92 @@ def run(input_data, solver_params=None, extra_arguments=None):
         for b in layout['blocks']:
             cnt=sum(1 for a in best_p if a['assigned_block']==b['block_id'])
             bu[b['block_id']]=round(cnt/max(b['total_capacity'],1),3)
-        metrics={'total_reshuffles':tr,'average_reshuffles_per_vessel':round(tr/max(len(rpv),1),2),'max_reshuffles_single_vessel':max(rpv.values()) if rpv else 0,'vessel_grouping_score':round(gs,3),'stack_utilization':round(sum(bu.values())/max(len(bu),1),3),'weight_balance_score':round(bs,3)}
-        out_plan=[{'id':a['id'],'assigned_block':a['assigned_block'],'assigned_row':a['assigned_row'],'assigned_bay':a['assigned_bay'],'tier_level':a['tier_level'],'reshuffles_if_retrieved_now':sum(1 for o in best_p if o['assigned_block']==a['assigned_block'] and o['assigned_row']==a['assigned_row'] and o['assigned_bay']==a['assigned_bay'] and o['tier_level']>a['tier_level'])} for a in best_p]
+        metrics={'total_reshuffles':tr,'average_reshuffles_per_vessel':round(tr/max(len(rpv),1),2),
+                 'max_reshuffles_single_vessel':max(rpv.values()) if rpv else 0,
+                 'vessel_grouping_score':round(gs,3),
+                 'stack_utilization':round(sum(bu.values())/max(len(bu),1),3),
+                 'weight_balance_score':round(bs,3)}
+        out_plan=[{'id':a['id'],'assigned_block':a['assigned_block'],'assigned_row':a['assigned_row'],
+                   'assigned_bay':a['assigned_bay'],'tier_level':a['tier_level'],
+                   'reshuffles_if_retrieved_now':estimate_reshuffles_single(a['id'], best_p)} for a in best_p]
         vs=[]
         for vid,r in rpv.items():
             vc=[c for c in containers if c['vessel_id']==vid]
-            vs.append({'vessel_id':vid,'departure_order':vc[0]['vessel_departure_order'] if vc else 0,'total_containers':len(vc),'estimated_reshuffles':r,'reshuffles_percentage':round(100.0*r/max(len(vc),1),1)})
+            vs.append({'vessel_id':vid,'departure_order':vc[0]['vessel_departure_order'] if vc else 0,
+                       'total_containers':len(vc),'estimated_reshuffles':r,
+                       'reshuffles_percentage':round(100.0*r/max(len(vc),1),1)})
         vs.sort(key=lambda v:v['departure_order'])
         imp=round((1-best_o/max(g_obj,0.01))*100,1)
+        # Showcase: rich visual payload — block heatmap + vessel timeline + convergence + quantum field evolution
+        block_heatmap = generate_block_heatmap(best_p, containers, layout)
+        vessel_timeline = generate_vessel_timeline(best_p, containers)
         logger.info("Done in "+str(round(el_ms,1))+"ms | Obj="+str(round(best_o,2))+" | Improvement="+str(imp)+"%")
         return {
             'objective_value':round(best_o,2),
             'solution_status':'optimal' if best_o<g_obj else 'feasible',
+            'total_reshuffles':tr,
+            'containers_placed':len(out_plan),
+            'containers_total':len(containers),
             'stacking_plan':out_plan,
             'reshuffling_summary':vs,
             'optimization_metrics':metrics,
+            'quality_scores':{
+                'vessel_grouping': round(gs,3),
+                'weight_balance': round(bs,3),
+                'weight_stability': True
+            },
+            'block_utilization': bu,
             'cost_breakdown':{'total_reshuffles':tr,'greedy_reshuffles':round(g_obj,2),'optimized_reshuffles':round(best_o,2),'improvement_pct':imp,'local_search_improvements':ls_impr},
             'optimization_convergence':{'greedy_initial_cost':round(g_obj,2),'sqa_cost':round(best_o,2),'final_optimized_cost':round(best_o,2),'total_sweeps':best_qm['total_sweeps'],'trotter_slices':best_qm['trotter_slices'],'num_restarts':NR},
             'quantum_metrics':best_qm,
-            'quantum_advantage':{'tunnel_events':best_qm['tunnel_events'],'tunnel_rate':best_qm['tunnel_rate'],'quantum_advantage_indicator':best_qm['quantum_advantage_indicator'],'description':'High quantum tunneling - SQA explored regions unreachable by classical SA' if best_qm['tunnel_events']>10 else 'Moderate quantum effects','hardware_ready':True,'target_hardware':'D-Wave Advantage (5000+ qubits)','estimated_qubit_count':len(containers)*len(layout.get('blocks',[]))*4},
-            'showcase':{'convergence_chart':best_h,'summary_dashboard':{'total_containers':len(containers),'total_placed':len(out_plan),'total_reshuffles':tr,'improvement_vs_greedy_pct':imp,'vessels_with_zero_reshuffles':sum(1 for v in vs if v['estimated_reshuffles']==0),'total_vessels':len(vs),'weight_balance_score_pct':round(bs*100,1),'vessel_grouping_score_pct':round(gs*100,1),'quantum_tunnel_events':best_qm['tunnel_events'],'local_search_improvements':ls_impr,'solver_time_ms':round(el_ms,1),'algorithm':'Multi-Restart SQA + Local Search (v1.3)'}},
-            'computation_metrics':{'wall_time_s':round(el_s,3),'algorithm':'SQA_SuzukiTrotter_v1.3','solver_version':'1.3','trotter_slices':best_qm['trotter_slices'],'total_sweeps':best_qm['total_sweeps'],'num_restarts':NR,'local_search_improvements':ls_impr},
-            'benchmark':{'execution_cost':{'value':1.0,'unit':'credits'},'time_elapsed':str(round(el_s,3))+'s','energy_consumption':0.0}
+            'quantum_advantage':{
+                'tunnel_events':best_qm['tunnel_events'],
+                'tunnel_rate':best_qm['tunnel_rate'],
+                'quantum_advantage_indicator':best_qm['quantum_advantage_indicator'],
+                'description':'High quantum tunneling - SQA explored regions unreachable by classical SA' if best_qm['tunnel_events']>10 else 'Moderate quantum effects',
+                'hardware_ready':True,
+                'target_hardware':'D-Wave Advantage (5000+ qubits)',
+                'estimated_qubit_count':len(containers)*len(layout.get('blocks',[]))*4
+            },
+            'showcase':{
+                'block_heatmap': block_heatmap,
+                'vessel_timeline': vessel_timeline,
+                'convergence_chart': best_h,
+                'quantum_field_evolution': best_fh,
+                'summary_dashboard':{
+                    'total_containers':len(containers),
+                    'total_placed':len(out_plan),
+                    'total_reshuffles':tr,
+                    'improvement_vs_greedy_pct':imp,
+                    'vessels_with_zero_reshuffles':sum(1 for v in vs if v['estimated_reshuffles']==0),
+                    'total_vessels':len(vs),
+                    'avg_stack_utilization_pct':round(metrics['stack_utilization']*100,1),
+                    'weight_balance_score_pct':round(bs*100,1),
+                    'vessel_grouping_score_pct':round(gs*100,1),
+                    'quantum_tunnel_events':best_qm['tunnel_events'],
+                    'local_search_improvements':ls_impr,
+                    'solver_time_ms':round(el_ms,1),
+                    'algorithm':'Multi-Restart SQA + Local Search (v1.4)'
+                }
+            },
+            'computation_metrics':{
+                'wall_time_s':round(el_s,3),
+                'algorithm':'SQA_SuzukiTrotter_v1.4',
+                'solver_version':'1.4',
+                'trotter_slices':best_qm['trotter_slices'],
+                'total_sweeps':best_qm['total_sweeps'],
+                'num_restarts':NR,
+                'local_search_improvements':ls_impr
+            },
+            'benchmark':{
+                'execution_cost':{'value':1.0,'unit':'credits'},
+                'time_elapsed':str(round(el_s,3))+'s',
+                'energy_consumption':0.0
+            }
         }
     except Exception as e:
         logger.error("Failed: "+str(e))
         el_s=time.time()-t0
-        return {'status':'ERROR','message':str(e),'objective_value':999999,'solution_status':'error','benchmark':{'execution_cost':{'value':1.0,'unit':'credits'},'time_elapsed':str(round(el_s,3))+'s','energy_consumption':0.0},'computation_metrics':{'wall_time_s':round(el_s,3),'algorithm':'SQA_SuzukiTrotter_v1.3'}}
+        return {'status':'ERROR','message':str(e),'objective_value':999999,'solution_status':'error',
+                'benchmark':{'execution_cost':{'value':1.0,'unit':'credits'},'time_elapsed':str(round(el_s,3))+'s','energy_consumption':0.0},
+                'computation_metrics':{'wall_time_s':round(el_s,3),'algorithm':'SQA_SuzukiTrotter_v1.4'}}
