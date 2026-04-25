@@ -1,11 +1,18 @@
-"""QCentroid Quantum SQA Container Yard Solver v1.5 — additional_output for Additional Output tab.
+"""QCentroid Quantum SQA Container Yard Solver v1.6 — file-based additional output.
 
-v1.5 (this rev): adds additional_output block (visualizations + kpi_dashboard + reports + narrative)
-                 so the platform's Additional Output tab renders. showcase kept as superset.
+v1.6 (this rev): writes visualization artifacts (PNG/HTML/JSON/CSV) into
+                 ./additional_output/ so the platform exposes them as
+                 downloadable files in the Additional Output tab; includes a
+                 fully interactive Plotly dashboard.
+v1.5: added additional_output block (visualizations + kpi_dashboard + reports + narrative).
 v1.4: enriched showcase with block_heatmap, vessel_timeline, quantum_field_evolution.
 """
-import time, math, random, json
+import os, time, math, random, json
 from copy import deepcopy
+try:
+    from viz import generate_additional_output
+except Exception:
+    generate_additional_output = None
 
 class QCentroidUserLogger:
     def __init__(self):
@@ -292,7 +299,7 @@ def run(input_data, solver_params=None, extra_arguments=None):
         data=input_data if 'containers' in input_data else input_data.get('data',input_data)
         containers=data.get('containers',[]); layout=data.get('yard_layout',{}); params=data.get('parameters',{})
         if solver_params: params.update(solver_params)
-        logger.info("Quantum SQA Solver v1.5 | "+str(len(containers))+" containers, "+str(layout.get('total_blocks',0))+" blocks")
+        logger.info("Quantum SQA Solver v1.6 | "+str(len(containers))+" containers, "+str(layout.get('total_blocks',0))+" blocks")
         if not containers or not layout:
             el_s_e = time.time()-t0
             return {"status":"ERROR","message":"Missing input","objective_value":999999,"solution_status":"error","benchmark":{"execution_cost":{"value":0.0,"unit":"credits"},"time_elapsed":str(round(el_s_e,3))+"s","energy_consumption":0.0}}
@@ -341,7 +348,7 @@ def run(input_data, solver_params=None, extra_arguments=None):
             'vessel_grouping_score_pct': round(gs*100, 1),
             'weight_balance_score_pct': round(bs*100, 1),
             'wall_time_s': round(el_s, 3),
-            'algorithm': 'Multi-Restart SQA + Local Search (v1.5)',
+            'algorithm': 'Multi-Restart SQA + Local Search (v1.6)',
             'quantum_tunnel_events': best_qm['tunnel_events'],
             'quantum_advantage_indicator': best_qm['quantum_advantage_indicator']
         }
@@ -351,7 +358,7 @@ def run(input_data, solver_params=None, extra_arguments=None):
             'schema_version': '1.0',
             'use_case': 'container-yard-stacking-optimization',
             'solver_family': 'quantum',
-            'solver_version': '1.5',
+            'solver_version': '1.6',
             'visualizations': [
                 {'name':'block_heatmap','type':'grid','description':'Top-down per-block container layout (rows × bays). Each cell shows stack height, dominant vessel, weight, and reshuffle indicator.','data':block_heatmap},
                 {'name':'vessel_timeline','type':'timeline','description':'Per-vessel reshuffle forecast in departure order with cumulative deltas and retrieval efficiency.','data':vessel_timeline},
@@ -368,6 +375,30 @@ def run(input_data, solver_params=None, extra_arguments=None):
             },
             'narrative': ('Quantum SQA placed all '+str(len(out_plan))+'/'+str(len(containers))+' containers; multi-restart explored '+str(best_qm['tunnel_events'])+' tunneling events across '+str(best_qm['total_sweeps'])+' sweeps; achieved '+str(imp)+'% improvement vs greedy initialization. Solution required '+str(tr)+' reshuffle(s) total; '+str(sum(1 for v in vs if v["estimated_reshuffles"]==0))+'/'+str(len(vs))+' vessels can be loaded without reshuffles.')
         }
+
+        # Write visualization files into ./additional_output/ for the platform tab.
+        files_meta = {"out_dir": None, "files": []}
+        if generate_additional_output is not None:
+            try:
+                files_meta = generate_additional_output(
+                    containers=containers,
+                    yard_layout=layout,
+                    stacking_plan=out_plan,
+                    block_heatmap=block_heatmap,
+                    vessel_timeline=vessel_timeline,
+                    convergence_history=best_h,
+                    field_history=best_fh,
+                    quantum_metrics=best_qm,
+                    kpi_dashboard=kpi_dashboard,
+                    narrative=additional_output['narrative'],
+                    out_dir=os.path.join(os.getcwd(), 'additional_output'),
+                    logger=logger,
+                )
+                logger.info("additional_output: wrote "+str(len(files_meta.get('files',[])))+" files to "+str(files_meta.get('out_dir')))
+            except Exception as e:
+                logger.warning("additional_output generation failed: "+str(e))
+        additional_output['files'] = files_meta.get('files', [])
+        additional_output['files_dir'] = files_meta.get('out_dir')
 
         logger.info("Done in "+str(round(el_ms,1))+"ms | Obj="+str(round(best_o,2))+" | Improvement="+str(imp)+"%")
         return {
@@ -387,7 +418,7 @@ def run(input_data, solver_params=None, extra_arguments=None):
             'quantum_advantage':{'tunnel_events':best_qm['tunnel_events'],'tunnel_rate':best_qm['tunnel_rate'],'quantum_advantage_indicator':best_qm['quantum_advantage_indicator'],'description':'High quantum tunneling - SQA explored regions unreachable by classical SA' if best_qm['tunnel_events']>10 else 'Moderate quantum effects','hardware_ready':True,'target_hardware':'D-Wave Advantage (5000+ qubits)','estimated_qubit_count':len(containers)*len(layout.get('blocks',[]))*4},
             'showcase':{'block_heatmap':block_heatmap,'vessel_timeline':vessel_timeline,'convergence_chart':best_h,'quantum_field_evolution':best_fh,'summary_dashboard':kpi_dashboard},
             'additional_output': additional_output,
-            'computation_metrics':{'wall_time_s':round(el_s,3),'algorithm':'SQA_SuzukiTrotter_v1.5','solver_version':'1.5','trotter_slices':best_qm['trotter_slices'],'total_sweeps':best_qm['total_sweeps'],'num_restarts':NR,'local_search_improvements':ls_impr},
+            'computation_metrics':{'wall_time_s':round(el_s,3),'algorithm':'SQA_SuzukiTrotter_v1.6','solver_version':'1.6','trotter_slices':best_qm['trotter_slices'],'total_sweeps':best_qm['total_sweeps'],'num_restarts':NR,'local_search_improvements':ls_impr},
             'benchmark':{'execution_cost':{'value':1.0,'unit':'credits'},'time_elapsed':str(round(el_s,3))+'s','energy_consumption':0.0}
         }
     except Exception as e:
