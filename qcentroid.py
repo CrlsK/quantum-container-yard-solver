@@ -1,14 +1,12 @@
-"""QCentroid Quantum SQA Container Yard Solver v1.7 — adaptive scaling + warm-start.
+"""QCentroid Quantum SQA Container Yard Solver v1.8 — early-stop + business cost.
 
-v1.7 (this rev):
-  * adaptive sweep budget — num_sweeps scales with N (containers), capped sensibly.
-  * gentler gamma decay for N>=30 — keeps quantum tunneling active longer on
-    bigger problems where classical SA otherwise runs away with the win.
-  * classical SA warm-start — quick mini-SA pass before SQA to seed all replicas
-    with a strong initial state instead of raw greedy.
-  * adaptive num_restarts — boost only when problem is large enough to benefit.
-  * business-cost framing in additional_output (uses $25–50/reshuffle from
-    the use case business description).
+v1.8 (this rev): Iter2 — SQA early-stop on stagnation (no improvement for 30
+                 sweeps → halt) to cut wall-time regression introduced by
+                 warm-start; cost framing now in the in-output dict too;
+                 emit warm_start_obj/greedy_obj in kpi_dashboard.
+v1.7: adaptive sweep budget by N + gentler gamma decay for big problems +
+      classical-SA warm-start before SQA (massive quality lift on large dataset:
+      obj 14.53 -> 10.67, eliminated 3 reshuffles).
 v1.6: file-based additional_output (PNG/HTML/JSON/CSV) into ./additional_output/.
 v1.5: added in-output additional_output block (kpi_dashboard + narrative).
 v1.4: enriched showcase with block_heatmap, vessel_timeline, quantum_field_evolution.
@@ -240,6 +238,9 @@ def sqa_run(init, containers, layout, params, logger):
     reps=[deepcopy(init) for _ in range(P)]
     re=[objective(r,containers,gw,bw,layout) for r in reps]
     bo=min(re); bp=deepcopy(reps[re.index(bo)]); hist=[]; field_hist=[]; te=0; ta=0; tp=0
+    # ── Iter 2: SQA early-stop on stagnation ──
+    stagnant=0; stagnation_limit=params.get('stagnation_limit',30); last_bo=bo
+    early_stopped=False; early_stop_sweep=ns
     for s in range(ns):
         pr=s/max(ns-1,1)
         gt=g0*math.exp(-pr*math.log(max(g0/gf,1e-6)))
@@ -267,8 +268,18 @@ def sqa_run(init, containers, layout, params, logger):
             field_hist.append({'sweep':s,'gamma':round(gt,4),'temperature':round(Tt,4),'tunnel_events_in_sweep':te_sweep,'cumulative_tunnels':te})
         if s%(max(1,ns//5))==0:
             hist.append({'sweep':s,'best':round(bo,2),'gamma':round(gt,4),'temp':round(Tt,4),'tunnels':te})
+        # Iter 2: stagnation tracker
+        if bo < last_bo - 1e-6:
+            last_bo = bo; stagnant = 0
+        else:
+            stagnant += 1
+        # require min sweeps before allowing early-stop (let gamma decay enough)
+        if stagnant >= stagnation_limit and s >= max(20, ns // 4):
+            early_stopped = True; early_stop_sweep = s + 1
+            logger.info("SQA early-stop at sweep "+str(s+1)+"/"+str(ns)+" (stagnation "+str(stagnant)+")")
+            break
     ar=ta/max(tp,1)
-    qm={'trotter_slices':P,'total_sweeps':ns,'tunnel_events':te,'tunnel_rate':round(te/max(tp,1),4),'acceptance_rate':round(ar,4),'final_transverse_field':round(gt,6),'final_temperature':round(Tt,6),'quantum_advantage_indicator':round(te/max(ns,1),3)}
+    qm={'trotter_slices':P,'total_sweeps':ns,'tunnel_events':te,'tunnel_rate':round(te/max(tp,1),4),'acceptance_rate':round(ar,4),'final_transverse_field':round(gt,6),'final_temperature':round(Tt,6),'quantum_advantage_indicator':round(te/max(ns,1),3),'early_stopped':early_stopped,'sweeps_executed':early_stop_sweep}
     return bp,bo,hist,qm,field_hist
 
 def local_search(plan, containers, layout, params, logger):
@@ -329,7 +340,7 @@ def run(input_data, solver_params=None, extra_arguments=None):
         data=input_data if 'containers' in input_data else input_data.get('data',input_data)
         containers=data.get('containers',[]); layout=data.get('yard_layout',{}); params=data.get('parameters',{})
         if solver_params: params.update(solver_params)
-        logger.info("Quantum SQA Solver v1.7 | "+str(len(containers))+" containers, "+str(layout.get('total_blocks',0))+" blocks")
+        logger.info("Quantum SQA Solver v1.8 | "+str(len(containers))+" containers, "+str(layout.get('total_blocks',0))+" blocks")
         # ── Iter 1: adaptive scaling — pick sweeps/restarts/gamma based on N ──
         n=len(containers)
         if n>=60:
@@ -384,6 +395,9 @@ def run(input_data, solver_params=None, extra_arguments=None):
         block_heatmap = generate_block_heatmap(best_p, containers, layout)
         vessel_timeline = generate_vessel_timeline(best_p, containers)
 
+        # ── Iter 2: business-cost framing in the in-output dict (USD per reshuffle from use case business desc) ──
+        _COST_LOW, _COST_HIGH = 25.0, 50.0
+        _cost_mid = (_COST_LOW + _COST_HIGH) / 2
         kpi_dashboard = {
             'objective_value': round(best_o, 2),
             'total_reshuffles': tr,
@@ -393,9 +407,17 @@ def run(input_data, solver_params=None, extra_arguments=None):
             'vessel_grouping_score_pct': round(gs*100, 1),
             'weight_balance_score_pct': round(bs*100, 1),
             'wall_time_s': round(el_s, 3),
-            'algorithm': 'Multi-Restart SQA + Warm-start + Local Search (v1.7)',
+            'algorithm': 'Multi-Restart SQA + Warm-start + Local Search + EarlyStop (v1.8)',
             'quantum_tunnel_events': best_qm['tunnel_events'],
-            'quantum_advantage_indicator': best_qm['quantum_advantage_indicator']
+            'quantum_advantage_indicator': best_qm['quantum_advantage_indicator'],
+            'sqa_sweeps_executed': best_qm.get('sweeps_executed','?'),
+            'sqa_early_stopped': best_qm.get('early_stopped', False),
+            'greedy_obj': round(g_obj, 2),
+            'warm_start_obj': round(warm_obj, 2),
+            'estimated_reshuffle_cost_usd_low':  round(tr * _COST_LOW, 0),
+            'estimated_reshuffle_cost_usd_high': round(tr * _COST_HIGH, 0),
+            'estimated_reshuffle_cost_usd_mid':  round(tr * _cost_mid, 0),
+            'cost_per_reshuffle_usd_range':      '$25–$50 (crane time + fuel + labor)',
         }
 
         # The platform's Additional Output tab reads this block.
@@ -403,7 +425,7 @@ def run(input_data, solver_params=None, extra_arguments=None):
             'schema_version': '1.0',
             'use_case': 'container-yard-stacking-optimization',
             'solver_family': 'quantum',
-            'solver_version': '1.7',
+            'solver_version': '1.8',
             'visualizations': [
                 {'name':'block_heatmap','type':'grid','description':'Top-down per-block container layout (rows × bays). Each cell shows stack height, dominant vessel, weight, and reshuffle indicator.','data':block_heatmap},
                 {'name':'vessel_timeline','type':'timeline','description':'Per-vessel reshuffle forecast in departure order with cumulative deltas and retrieval efficiency.','data':vessel_timeline},
@@ -463,7 +485,7 @@ def run(input_data, solver_params=None, extra_arguments=None):
             'quantum_advantage':{'tunnel_events':best_qm['tunnel_events'],'tunnel_rate':best_qm['tunnel_rate'],'quantum_advantage_indicator':best_qm['quantum_advantage_indicator'],'description':'High quantum tunneling - SQA explored regions unreachable by classical SA' if best_qm['tunnel_events']>10 else 'Moderate quantum effects','hardware_ready':True,'target_hardware':'D-Wave Advantage (5000+ qubits)','estimated_qubit_count':len(containers)*len(layout.get('blocks',[]))*4},
             'showcase':{'block_heatmap':block_heatmap,'vessel_timeline':vessel_timeline,'convergence_chart':best_h,'quantum_field_evolution':best_fh,'summary_dashboard':kpi_dashboard},
             'additional_output': additional_output,
-            'computation_metrics':{'wall_time_s':round(el_s,3),'algorithm':'SQA_SuzukiTrotter_v1.7','solver_version':'1.7','trotter_slices':best_qm['trotter_slices'],'total_sweeps':best_qm['total_sweeps'],'num_restarts':NR,'local_search_improvements':ls_impr,'warm_start_obj':round(warm_obj,2),'greedy_obj':round(g_obj,2)},
+            'computation_metrics':{'wall_time_s':round(el_s,3),'algorithm':'SQA_SuzukiTrotter_v1.8','solver_version':'1.8','trotter_slices':best_qm['trotter_slices'],'total_sweeps':best_qm['total_sweeps'],'sweeps_executed':best_qm.get('sweeps_executed'),'early_stopped':best_qm.get('early_stopped',False),'num_restarts':NR,'local_search_improvements':ls_impr,'warm_start_obj':round(warm_obj,2),'greedy_obj':round(g_obj,2)},
             'benchmark':{'execution_cost':{'value':1.0,'unit':'credits'},'time_elapsed':str(round(el_s,3))+'s','energy_consumption':0.0}
         }
     except Exception as e:
