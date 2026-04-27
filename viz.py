@@ -459,6 +459,19 @@ def _write_interactive_html(out_dir, containers, kpi, narrative, block_heatmap,
     return path
 
 
+def _enrich_kpi_with_cost(kpi, total_reshuffles, n_containers, n_vessels):
+    """Iter 1: add business-cost framing using $25–50/reshuffle from the use case
+    business description (port operations: crane time + fuel + labor)."""
+    low, high = 25.0, 50.0
+    avg = (low + high) / 2
+    enriched = dict(kpi)
+    enriched['estimated_reshuffle_cost_usd_low']  = round(total_reshuffles * low, 0)
+    enriched['estimated_reshuffle_cost_usd_high'] = round(total_reshuffles * high, 0)
+    enriched['estimated_reshuffle_cost_usd_mid']  = round(total_reshuffles * avg, 0)
+    enriched['cost_per_reshuffle_usd_range']      = '$25–$50 (crane time + fuel + labor)'
+    return enriched
+
+
 def generate_additional_output(containers, yard_layout, stacking_plan, block_heatmap,
                                vessel_timeline, convergence_history, field_history,
                                quantum_metrics, kpi_dashboard, narrative,
@@ -472,6 +485,10 @@ def generate_additional_output(containers, yard_layout, stacking_plan, block_hea
         out_dir = os.path.join(os.getcwd(), "additional_output")
     _ensure_dir(out_dir)
     written = []
+    total_reshuffles = 0
+    for v in (vessel_timeline or []): total_reshuffles += v.get('reshuffles', 0)
+    n_vessels = len({c.get('vessel_id') for c in containers})
+    kpi_dashboard = _enrich_kpi_with_cost(kpi_dashboard, total_reshuffles, len(containers), n_vessels)
 
     def _try(fn, label, *a, **kw):
         try:
